@@ -13,7 +13,7 @@ from PIL import Image, ImageEnhance, ImageOps
 import streamlit as st
 
 from ai_service import analyze_images
-from geometry_engine import solve_composite
+from geometry_engine import solve_composite, validate_textbook_10_21_22
 from symbolic_engine import solve_symbolic
 
 st.set_page_config(page_title="AI 截面慣性矩全題型教學系統",page_icon="📐",layout="wide",initial_sidebar_state="expanded")
@@ -59,11 +59,15 @@ def sidebar():
     max_count=int(secret("MAX_ANALYSES_PER_SESSION",5) or 5)
     st.sidebar.caption(f"本次工作階段已解析 {st.session_state.analysis_count}/{max_count} 次。")
     st.sidebar.divider()
+    verify=bool(secret("ENABLE_AI_VERIFICATION",True))
+    fallbacks=str(secret("GEMINI_FALLBACK_MODELS","gemini-3.1-flash-lite-preview,gemini-2.5-flash"))
+    st.sidebar.caption("二次幾何審查：" + ("已啟用" if verify else "未啟用"))
+    st.sidebar.caption("備用模型：" + fallbacks)
     st.sidebar.markdown("**本地引擎支援**\n- 組合截面、孔洞、多邊形\n- T/U/工字型梁\n- 曲線陰影直角座標積分\n- 極座標扇形積分\n- 原始軸、形心軸、指定軸\n- Ix、Iy、Ixy、J、kx、ky")
-    return key,model
+    return key,model,verify,[x.strip() for x in fallbacks.split(",") if x.strip()]
 
 
-def render_upload(api_key,model):
+def render_upload(api_key,model,verify,fallback_models):
     st.header("① 上傳題目照片")
     st.write("可一次上傳多張，例如題目文字與共用圖形分開拍。系統會辨識多個題號。")
     files=st.file_uploader("拍攝或選擇題目圖片",type=["jpg","jpeg","png","webp","bmp"],accept_multiple_files=True)
@@ -83,7 +87,7 @@ def render_upload(api_key,model):
     if st.button("🔍 AI 辨識題目並建立解題模型",type="primary",use_container_width=True,disabled=(not api_key or st.session_state.analysis_count>=max_count)):
         with st.spinner("正在辨識題號、尺寸、陰影範圍、曲線與指定軸……"):
             try:
-                a=analyze_images(prepared,api_key,model); st.session_state.analysis=a; st.session_state.selected_problem=0; st.session_state.solution=None; st.session_state.analysis_count+=1
+                a=analyze_images(prepared,api_key,model,fallback_models=fallback_models,enable_verification=verify); st.session_state.analysis=a; st.session_state.selected_problem=0; st.session_state.solution=None; st.session_state.analysis_count+=1
                 ps=a.get("problems") or []
                 if ps: st.session_state.edited_problem_json=json.dumps(ps[0],ensure_ascii=False,indent=2)
                 st.success(f"辨識完成，共找到 {len(ps)} 個題目。")
@@ -100,6 +104,12 @@ def problem_editor():
     p=ps[idx]; c1,c2,c3=st.columns(3); c1.metric("題型",p.get("mode","")); c2.metric("信心度",f"{float(p.get('confidence',0)):.0%}"); c3.metric("單位",p.get("unit","symbolic"))
     st.write(p.get("recognized_text") or ""); st.info(p.get("reasoning_summary") or "無模型說明。")
     if p.get("warnings"): st.warning("\n".join(f"• {x}" for x in p["warnings"]))
+    if p.get("geometry_audit"):
+        with st.expander("幾何尺寸鏈與板件稽核", expanded=True):
+            st.json(p.get("geometry_audit"))
+    meta=(a.get("analysis_meta") or {})
+    if meta.get("deterministic_repairs"):
+        st.success("已啟用課本題型幾何校正：補齊遺漏板件並驗證尺寸鏈。")
     with st.expander("進階：檢查或修正 AI 建立的解題 JSON"):
         edited=st.text_area("修改後按套用",value=st.session_state.edited_problem_json,height=520)
         if st.button("套用 JSON 修改"):
@@ -125,7 +135,7 @@ def draw_composite(solution):
         if kind=="rectangle":
             b,h=float(c["b"]),float(c["h"]); x,y=float(c.get("x",0)),float(c.get("y",0)); ang=float(c.get("angle",0)); pts=[(-b/2,-h/2),(b/2,-h/2),(b/2,h/2),(-b/2,h/2)]; t=math.radians(ang); pts=[(x+px*math.cos(t)-py*math.sin(t),y+px*math.sin(t)+py*math.cos(t)) for px,py in pts]; ax.add_patch(Polygon(pts,closed=True,facecolor=fc,edgecolor=ec,linewidth=2,linestyle=ls))
         elif kind=="circle":
-            r=float(c.get("r",float(c.get("d"))/2)); ax.add_patch(Circle((float(c.get("x",0)),float(c.get("y",0))),r,facecolor=fc,edgecolor=ec,linewidth=2,linestyle=ls))
+            r=float(c["r"]) if c.get("r") is not None else float(c["d"])/2; ax.add_patch(Circle((float(c.get("x",0)),float(c.get("y",0))),r,facecolor=fc,edgecolor=ec,linewidth=2,linestyle=ls))
         elif kind=="ellipse":
             ax.add_patch(Ellipse((float(c.get("x",0)),float(c.get("y",0))),2*float(c["a"]),2*float(c["b"]),angle=float(c.get("angle",0)),facecolor=fc,edgecolor=ec,linewidth=2,linestyle=ls))
         elif kind in {"polygon","triangle","trapezoid"}: ax.add_patch(Polygon(c.get("vertices") or [],closed=True,facecolor=fc,edgecolor=ec,linewidth=2,linestyle=ls))
@@ -145,6 +155,25 @@ def render_composite(p,s):
     cols=st.columns(6)
     for col,(lab,v,suf) in zip(cols,vals2): col.metric(lab,f"{fmt(v)} {suf}")
     st.markdown("### 題目指定軸"); st.write(f"- 水平軸 y={s['axis_y']}：**Ix={fmt(s['Ix_axis_y'])} {u}⁴**"); st.write(f"- 垂直軸 x={s['axis_x']}：**Iy={fmt(s['Iy_axis_x'])} {u}⁴**")
+    if str(p.get("problem_id")) in {"10-21","10-22","10-21/22"}:
+        validation=validate_textbook_10_21_22(s)
+        st.markdown("### 與課本答案核對")
+        st.write("- 10-21：**ȳ = 22.5 mm；Ix′ = 34.4×10⁶ mm⁴**")
+        st.write("- 10-22：**Iy = 122×10⁶ mm⁴**")
+        if validation["passed"]:
+            st.success("本地計算與課本答案一致（允許課本四捨五入誤差）。")
+        else:
+            st.error("計算結果與課本答案不一致，請檢查 AI 建立的板件與尺寸。")
+        check_rows=[]
+        for key,item in validation["checks"].items():
+            check_rows.append({
+                "項目":key,
+                "程式值":item["actual"],
+                "基準值":item["expected"],
+                "相對誤差":item["relative_error"],
+                "通過":item["passed"],
+            })
+        st.dataframe(pd.DataFrame(check_rows),use_container_width=True,hide_index=True)
     l,r=st.columns([1,1.5])
     with l:
         fig=draw_composite(s); st.pyplot(fig,use_container_width=True); plt.close(fig)
@@ -211,6 +240,8 @@ def render_help():
 - 直角座標曲線陰影積分
 - 極座標扇形與環形扇形
 - 一張照片多題號選擇
+- 兩階段 AI 幾何審查、503 自動重試與備用模型
+- 課本 10-21/10-22 尺寸鏈與標準答案自動驗證
 
 ### 目前不支援
 - 三維剛體質量慣性矩
@@ -218,11 +249,11 @@ def render_help():
 - 缺少完整邊界、尺寸或指定軸的照片
 """)
 
-init_state(); api_key,model=sidebar()
-st.title("📐 AI 拍照解析－截面慣性矩全題型教學系統 v2")
+init_state(); api_key,model,verify,fallback_models=sidebar()
+st.title("📐 AI 拍照解析－截面慣性矩全題型教學系統 v2.1")
 st.caption("組合截面、曲線陰影積分、圓形扇形、T/U 型梁、指定軸與形心軸。")
 t1,t2,t3,t4,t5=st.tabs(["① 拍照與 AI 辨識","② 確認模型與計算","③ 完整步驟","匯出","使用說明"])
-with t1: render_upload(api_key,model)
+with t1: render_upload(api_key,model,verify,fallback_models)
 with t2: render_solve()
 with t3: render_steps()
 with t4: render_export()

@@ -29,3 +29,19 @@ r3 = solve_cartesian({
 assert "a" in r3["results"]["A"]["sympy"] and "b" in r3["results"]["A"]["sympy"]
 
 print("ALL TESTS PASSED")
+
+
+from geometry_engine import (
+    textbook_10_21_22_solution,
+    validate_textbook_10_21_22,
+)
+
+textbook = textbook_10_21_22_solution()
+validation = validate_textbook_10_21_22(textbook, relative_tolerance=1e-9)
+assert validation["passed"]
+assert abs(textbook["A"] - 15625.0) < 1e-9
+assert abs(textbook["xbar"]) < 1e-9
+assert abs(textbook["ybar"] - 22.5) < 1e-9
+assert abs(textbook["Ix_centroid"] - 34.407552083333336e6) < 1e-5
+assert abs(textbook["Iy_origin"] - 121.90755208333333e6) < 1e-5
+print("textbook 10-21/22 benchmark: PASS")

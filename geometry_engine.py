@@ -192,6 +192,120 @@ def solve_composite(components: Sequence[Dict[str, Any]], axis_x: float = 0.0, a
     return {"mode":"composite","A":area,"xbar":cx,"ybar":cy,"Ix_origin":ix0,"Iy_origin":iy0,"Ixy_origin":ixy0,"Ix_centroid":ixc,"Iy_centroid":iyc,"Ixy_centroid":ixyc,"J_origin":ix0+iy0,"J_centroid":ixc+iyc,"kx_centroid":math.sqrt(ixc/area),"ky_centroid":math.sqrt(iyc/area),"axis_x":axis_x,"axis_y":axis_y,"Ix_axis_y":ixa,"Iy_axis_x":iya,"rotated_axis_angle_deg":rotated_axis_angle_deg,**rotated,"rows":rows,"primitives":[p.to_dict() for p in primitives],"components":list(components)}
 
 
+
+TEXTBOOK_10_21_22_EXPECTED = {
+    "ybar_mm": 22.5,
+    "Ix_centroid_mm4": 34.407552083333336e6,
+    "Iy_origin_mm4": 121.90755208333333e6,
+}
+
+
+def textbook_10_21_22_components() -> List[Dict[str, Any]]:
+    """Exact non-overlapping decomposition for the uploaded textbook 10-21/22 figure.
+
+    Coordinate system:
+    - y axis is the vertical symmetry axis.
+    - original x axis is along the bottom surface of the 25 mm horizontal plate.
+    - horizontal base width:
+      50 + 25 + 75 + 25 + 75 + 25 + 50 = 325 mm.
+    - two upper plates: 25 x 100 mm.
+    - one central lower plate: 25 x 100 mm.
+    """
+    return [
+        {
+            "name": "底部水平板",
+            "kind": "rectangle",
+            "sign": 1,
+            "b": 325.0,
+            "h": 25.0,
+            "x": 0.0,
+            "y": 12.5,
+            "angle": 0.0,
+            "source": "50+25+75+25+75+25+50=325 mm；厚度 25 mm",
+        },
+        {
+            "name": "左側上立板",
+            "kind": "rectangle",
+            "sign": 1,
+            "b": 25.0,
+            "h": 100.0,
+            "x": -100.0,
+            "y": 75.0,
+            "angle": 0.0,
+            "source": "左側立板 25 x 100 mm，位於底板上方",
+        },
+        {
+            "name": "右側上立板",
+            "kind": "rectangle",
+            "sign": 1,
+            "b": 25.0,
+            "h": 100.0,
+            "x": 100.0,
+            "y": 75.0,
+            "angle": 0.0,
+            "source": "右側立板 25 x 100 mm，位於底板上方",
+        },
+        {
+            "name": "中央下立板",
+            "kind": "rectangle",
+            "sign": 1,
+            "b": 25.0,
+            "h": 100.0,
+            "x": 0.0,
+            "y": -50.0,
+            "angle": 0.0,
+            "source": "中央向下立板 25 x 100 mm，不可遺漏",
+        },
+    ]
+
+
+def textbook_10_21_22_solution() -> Dict[str, Any]:
+    return solve_composite(
+        textbook_10_21_22_components(),
+        axis_x=0.0,
+        axis_y=0.0,
+    )
+
+
+def validate_textbook_10_21_22(
+    result: Dict[str, Any],
+    relative_tolerance: float = 0.01,
+) -> Dict[str, Any]:
+    """Compare a computed result with the printed textbook answers."""
+    expected = TEXTBOOK_10_21_22_EXPECTED
+
+    def check(actual: float, target: float) -> Dict[str, Any]:
+        error = actual - target
+        rel = abs(error) / abs(target) if target else abs(error)
+        return {
+            "actual": actual,
+            "expected": target,
+            "absolute_error": error,
+            "relative_error": rel,
+            "passed": rel <= relative_tolerance,
+        }
+
+    checks = {
+        "ybar": check(float(result["ybar"]), expected["ybar_mm"]),
+        "Ix_centroid": check(
+            float(result["Ix_centroid"]),
+            expected["Ix_centroid_mm4"],
+        ),
+        "Iy_origin": check(
+            float(result["Iy_origin"]),
+            expected["Iy_origin_mm4"],
+        ),
+    }
+    return {
+        "passed": all(item["passed"] for item in checks.values()),
+        "checks": checks,
+        "textbook_rounded": {
+            "10-21": "ȳ = 22.5 mm；Ix′ = 34.4×10^6 mm⁴",
+            "10-22": "Iy = 122×10^6 mm⁴",
+        },
+    }
+
+
 def self_test() -> bool:
     r=solve_composite([{"name":"R","kind":"rectangle","b":100,"h":50,"x":0,"y":0}])
     assert abs(r["A"]-5000)<1e-9
@@ -200,4 +314,12 @@ def self_test() -> bool:
     assert abs(t["A"]-30000)<1e-6 and abs(t["xbar"]-200)<1e-6
     s=solve_composite([{"name":"Q","kind":"circular_sector","r_outer":1,"theta1":0,"theta2":math.pi/2}])
     assert abs(s["A"]-math.pi/4)<1e-9
+
+    textbook = textbook_10_21_22_solution()
+    validation = validate_textbook_10_21_22(textbook, relative_tolerance=1e-9)
+    assert validation["passed"]
+    assert abs(textbook["A"] - 15625.0) < 1e-9
+    assert abs(textbook["ybar"] - 22.5) < 1e-9
+    assert abs(textbook["Ix_centroid"] - 34.407552083333336e6) < 1e-5
+    assert abs(textbook["Iy_origin"] - 121.90755208333333e6) < 1e-5
     return True
