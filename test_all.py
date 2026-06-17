@@ -45,3 +45,42 @@ assert abs(textbook["ybar"] - 22.5) < 1e-9
 assert abs(textbook["Ix_centroid"] - 34.407552083333336e6) < 1e-5
 assert abs(textbook["Iy_origin"] - 121.90755208333333e6) < 1e-5
 print("textbook 10-21/22 benchmark: PASS")
+
+
+from ai_service import _normalize, _extract_json
+
+top_level_array = [
+    {
+        "problem_id": "10-21",
+        "mode": "composite",
+        "unit": "mm",
+        "components": [],
+    }
+]
+normalized = _normalize(top_level_array)
+assert len(normalized["problems"]) == 1
+assert normalized["problems"][0]["problem_id"] == "10-21"
+
+nested_array = {
+    "recognized_text": "test",
+    "problems": [[
+        {"problem_id": "10-21", "mode": "composite"},
+        {"problem_id": "10-22", "mode": "composite"},
+    ]],
+}
+normalized_nested = _normalize(nested_array)
+assert len(normalized_nested["problems"]) == 2
+
+single_problem_object = {
+    "recognized_text": "test",
+    "problem": {"problem_id": "10-9", "mode": "polar"},
+}
+normalized_single = _normalize(single_problem_object)
+assert len(normalized_single["problems"]) == 1
+assert normalized_single["problems"][0]["problem_id"] == "10-9"
+
+parsed_array = _extract_json(
+    '前置文字\\n[{"problem_id":"10-10","mode":"cartesian"}]\\n'
+)
+assert isinstance(parsed_array, list)
+print("robust Gemini JSON schema parser: PASS")

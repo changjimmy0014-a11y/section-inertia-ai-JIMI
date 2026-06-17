@@ -1,4 +1,4 @@
-# AI 截面慣性矩全題型網頁版 v2.1
+# AI 截面慣性矩全題型網頁版 v2.2
 
 ## 本次新增
 
@@ -93,3 +93,37 @@ v2.1 另新增：
 - 503／429 自動重試
 - 自動切換備用 Gemini 模型
 - 10-21／10-22 確定幾何的本地修正與課本答案比對
+
+
+## v2.2：修正 list object has no attribute get
+
+Gemini 有時不會依照提示回傳：
+
+```json
+{"recognized_text":"...", "problems":[...]}
+```
+
+而會直接回傳：
+
+```json
+[
+  {"problem_id":"10-21", "...":"..."},
+  {"problem_id":"10-22", "...":"..."}
+]
+```
+
+或把 `problems` 包成巢狀陣列。舊版直接對回傳值呼叫 `.get()`，
+因此出現：
+
+```text
+'list' object has no attribute 'get'
+```
+
+v2.2 已支援：
+
+- 頂層 JSON 陣列
+- `problems` 為單一物件
+- 巢狀問題陣列
+- `problem`、`questions`、`items`、`results` 等替代欄位
+- 非標準 warnings、components、geometry_audit 格式
+- 無效項目自動忽略，不再讓整個網站崩潰

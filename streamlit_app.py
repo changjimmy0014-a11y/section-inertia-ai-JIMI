@@ -250,7 +250,7 @@ def render_help():
 """)
 
 init_state(); api_key,model,verify,fallback_models=sidebar()
-st.title("📐 AI 拍照解析－截面慣性矩全題型教學系統 v2.1")
+st.title("📐 AI 拍照解析－截面慣性矩全題型教學系統 v2.2")
 st.caption("組合截面、曲線陰影積分、圓形扇形、T/U 型梁、指定軸與形心軸。")
 t1,t2,t3,t4,t5=st.tabs(["① 拍照與 AI 辨識","② 確認模型與計算","③ 完整步驟","匯出","使用說明"])
 with t1: render_upload(api_key,model,verify,fallback_models)

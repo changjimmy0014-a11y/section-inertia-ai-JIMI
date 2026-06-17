@@ -146,44 +146,156 @@ REVIEW_PROMPT = r"""
 """
 
 
-def _extract_json(text: str) -> Dict[str, Any]:
-    cleaned = text.strip()
+def _extract_json(text: str) -> Any:
+    """Parse either a JSON object or a JSON array returned by Gemini."""
+    cleaned = str(text or "").strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\s*```$", "", cleaned)
+
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        start, end = cleaned.find("{"), cleaned.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(cleaned[start:end + 1])
+        # Gemini occasionally places a short sentence before the JSON.
+        object_start = cleaned.find("{")
+        object_end = cleaned.rfind("}")
+        array_start = cleaned.find("[")
+        array_end = cleaned.rfind("]")
+
+        candidates = []
+        if object_start >= 0 and object_end > object_start:
+            candidates.append(cleaned[object_start:object_end + 1])
+        if array_start >= 0 and array_end > array_start:
+            candidates.append(cleaned[array_start:array_end + 1])
+
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+
         raise ValueError("AI 回傳內容不是合法 JSON。")
 
 
-def _normalize(data: Dict[str, Any]) -> Dict[str, Any]:
+def _flatten_problem_items(value: Any) -> List[Dict[str, Any]]:
+    """Accept dict/list/nested-list problem payloads without crashing."""
+    output: List[Dict[str, Any]] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            # Some models wrap the real problem inside {"problem": {...}}.
+            wrapped = item.get("problem")
+            if (
+                isinstance(wrapped, dict)
+                and not any(
+                    key in item
+                    for key in ("problem_id", "mode", "components", "title")
+                )
+            ):
+                visit(wrapped)
+            else:
+                output.append(item)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+        # Strings, numbers, null and other malformed entries are ignored.
+
+    visit(value)
+    return output
+
+
+def _coerce_top_level(data: Any) -> Dict[str, Any]:
+    """Convert common Gemini JSON variations into the expected object schema."""
+    if isinstance(data, list):
+        # Most common cause of "'list' object has no attribute 'get'".
+        return {
+            "recognized_text": "",
+            "problems": _flatten_problem_items(data),
+            "analysis_meta": {
+                "schema_repair": "AI 回傳頂層陣列，已自動轉成 problems。"
+            },
+        }
+
+    if not isinstance(data, dict):
+        return {
+            "recognized_text": "",
+            "problems": [],
+            "analysis_meta": {
+                "schema_repair": f"AI 回傳 {type(data).__name__}，無法建立題目。"
+            },
+        }
+
+    result = dict(data)
+
+    # Common alternative field names.
+    if "problems" not in result:
+        for alternative in ("problem", "questions", "items", "results"):
+            if alternative in result:
+                result["problems"] = result.get(alternative)
+                break
+
+    result["problems"] = _flatten_problem_items(result.get("problems") or [])
+
+    meta = result.get("analysis_meta")
+    if not isinstance(meta, dict):
+        result["analysis_meta"] = {
+            "schema_repair": "analysis_meta 格式不正確，已重設。"
+        }
+
+    return result
+
+
+def _safe_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _safe_dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _normalize(data: Any) -> Dict[str, Any]:
+    data = _coerce_top_level(data)
     result = {
-        "recognized_text": str((data or {}).get("recognized_text") or ""),
+        "recognized_text": str(data.get("recognized_text") or ""),
         "problems": [],
-        "analysis_meta": dict((data or {}).get("analysis_meta") or {}),
+        "analysis_meta": _safe_dict(data.get("analysis_meta")),
     }
-    for index, raw in enumerate((data or {}).get("problems") or [], start=1):
+
+    for index, raw in enumerate(data.get("problems") or [], start=1):
+        if not isinstance(raw, dict):
+            continue
+
         problem = {
             "problem_id": str(raw.get("problem_id") or f"題目 {index}"),
             "title": str(raw.get("title") or ""),
             "recognized_text": str(raw.get("recognized_text") or ""),
             "mode": str(raw.get("mode") or "unsupported").lower(),
             "unit": str(raw.get("unit") or "symbolic"),
-            "requested": raw.get("requested") or [],
-            "target_axes_description": str(raw.get("target_axes_description") or ""),
+            "requested": _safe_list(raw.get("requested")),
+            "target_axes_description": str(
+                raw.get("target_axes_description") or ""
+            ),
             "axis_x": "0" if raw.get("axis_x") is None else str(raw.get("axis_x")),
             "axis_y": "0" if raw.get("axis_y") is None else str(raw.get("axis_y")),
-            "variables": raw.get("variables") or {},
-            "angle_variables_degrees": raw.get("angle_variables_degrees") or [],
+            "variables": _safe_dict(raw.get("variables")),
+            "angle_variables_degrees": _safe_list(
+                raw.get("angle_variables_degrees")
+            ),
             "can_solve": bool(raw.get("can_solve", False)),
             "confidence": 0.0,
             "reasoning_summary": str(raw.get("reasoning_summary") or ""),
-            "warnings": list(raw.get("warnings") or []),
-            "geometry_audit": raw.get("geometry_audit") or {},
-            "components": raw.get("components") or [],
+            "warnings": [
+                str(item) for item in _safe_list(raw.get("warnings"))
+            ],
+            "geometry_audit": _safe_dict(raw.get("geometry_audit")),
+            "components": [
+                item
+                for item in _safe_list(raw.get("components"))
+                if isinstance(item, dict)
+            ],
             "orientation": raw.get("orientation"),
             "lower_bound": raw.get("lower_bound"),
             "upper_bound": raw.get("upper_bound"),
@@ -196,14 +308,22 @@ def _normalize(data: Dict[str, Any]) -> Dict[str, Any]:
             "r_inner": raw.get("r_inner"),
             "r_outer": raw.get("r_outer"),
         }
+
         try:
             problem["confidence"] = max(
                 0.0,
                 min(1.0, float(raw.get("confidence", 0))),
             )
-        except Exception:
+        except (TypeError, ValueError):
             problem["confidence"] = 0.0
+
         result["problems"].append(problem)
+
+    if not result["problems"]:
+        result["analysis_meta"]["schema_warning"] = (
+            "AI 回傳 JSON，但沒有可用的題目物件。請重新拍攝完整題目。"
+        )
+
     return result
 
 
@@ -312,7 +432,7 @@ def _generate_json(
     prompt: str,
     model_candidates: Sequence[str],
     max_retries_per_model: int = 2,
-) -> Tuple[Dict[str, Any], str]:
+) -> Tuple[Any, str]:
     errors: List[str] = []
     config = types.GenerateContentConfig(
         temperature=0.03,
