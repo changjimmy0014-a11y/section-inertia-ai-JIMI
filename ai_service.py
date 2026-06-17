@@ -1,197 +1,135 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import base64
 import json
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Sequence, Tuple
 
+PROMPT = r'''
+你是大學靜力學與材料力學教師，也是幾何資料擷取器。請讀取使用者上傳的所有照片。
+照片可能包含題目文字與另一張共用圖形，也可能一張圖同時對應兩個題號。
 
-ANALYSIS_PROMPT = r"""
-你是一位大學靜力學與材料力學教師。請仔細讀取這張「截面面積慣性矩」題目照片，
-辨識題目文字、尺寸標註、座標軸、孔洞、陰影範圍與要求計算的物理量。
+目標：把每個題目轉成可由本地公式引擎精確解題的 JSON。
+只能輸出合法 JSON，不要 Markdown，不要額外文字。不可猜測模糊尺寸；模糊時填 null 並在 warnings 說明。
+題目要求哪個軸，就保留哪個軸，不能固定改成形心軸。
 
-你的工作不只是 OCR，而是將題目轉換成可由程式驗算的組合截面資料。
-只能輸出一個合法 JSON 物件，不要輸出 Markdown 程式碼框，也不要在 JSON 前後加入說明。
+支援四類：
 
-規則：
-1. 不可猜測看不清楚的尺寸。看不清楚時使用 null，並在 warnings 說明。
-2. 所有尺寸與 x、y 必須使用同一長度單位，unit 填 mm、cm、m 或 in。
-3. 若題目沒有指定座標原點，建立方便計算的全域座標：
-   x=0 設在整個截面的最左側；y=0 設在整個截面的最下側；
-   x 向右為正，y 向上為正。
-4. components 中的 x、y 必須是「該子截面自身形心」的全域座標，不是左下角。
-5. 優先將組合截面拆成不重疊的矩形與圓形。孔洞 sign=-1，實體 sign=1。
-6. 支援的 shape 只能是：
-   矩形、圓形、I 型鋼、T 型截面、中空矩形、中空圓管。
-7. 尺寸欄位：
-   矩形 params={"b":寬度,"h":高度}
-   圓形 params={"d":直徑}
-   I 型鋼 params={"B":翼板寬,"H":總高度,"tw":腹板厚,"tf":翼板厚}
-   T 型截面 params={"B":翼板寬,"H":總高度,"tw":腹板厚,"tf":翼板厚}
-   中空矩形 params={"B":外寬,"H":外高,"b":內寬,"h":內高}
-   中空圓管 params={"D":外徑,"d":內徑}
-8. 若輪廓無法用上述形狀精確表示，不要硬套。將 can_auto_build=false 並在 warnings 說明。
-9. confidence 為 0 到 1。只有必要尺寸和位置都清楚時，can_auto_build 才能是 true。
-10. requested_quantities 可包含 centroid、Ix、Iy、kx、ky、other。
-11. 若題目要求指定軸而不是整體形心軸，請在 target_axes 與 warnings 說明。
-12. recognized_text 忠實抄錄照片文字；不清楚的內容用 [?]，不可自行補寫。
-13. problem_summary、decomposition_reason、assumptions、warnings 使用繁體中文。
-14. 不要將 AI 自己算出的 Ix、Iy 當標準答案；數值會由本地公式引擎重新計算。
+A. composite：組合面積、梁截面、孔洞。
+元件格式：
+- rectangle: {"kind":"rectangle","name":"...","sign":1,"b":寬,"h":高,"x":形心x,"y":形心y,"angle":0}
+- circle: {"kind":"circle","name":"...","sign":-1,"r":半徑,"x":圓心x,"y":圓心y}
+- ellipse: {"kind":"ellipse","name":"...","sign":1,"a":x半軸,"b":y半軸,"x":形心x,"y":形心y,"angle":0}
+- polygon: {"kind":"polygon","name":"...","sign":1,"vertices":[[x1,y1],[x2,y2],...]}
+- circular_sector: {"kind":"circular_sector","name":"...","sign":1,"center_x":0,"center_y":0,"r_inner":0,"r_outer":100,"theta1":-30,"theta2":30,"angle_unit":"deg"}
+元件不可重疊；孔洞 sign=-1。T 型、U 型、工字型與複雜梁拆成不重疊矩形。斜邊梯形可用 polygon，圓孔用負 circle。
+axis_x 是指定垂直 y 軸的 x 座標；axis_y 是指定水平 x 軸的 y 座標。
 
-JSON 格式：
+B. cartesian：曲線陰影直角座標積分。
+垂直條帶：mode="cartesian", orientation="vertical", lower_bound/upper_bound 是 x 範圍，lower_function/upper_function 是 y(x)。
+水平條帶：orientation="horizontal", lower_bound/upper_bound 是 y 範圍，left_function/right_function 是 x(y)。
+運算式只能用 + - * / ^、sqrt、sin、cos、tan、pi 和變數。
+例：y^2=1-x 且左側為 y 軸，使用 horizontal：y=-1 到 1，left_function="0"，right_function="1-y^2"。
+例：y^2=(b^2/a)x，依陰影完整邊界建立函數；圖不完整時 can_solve=false。
+
+C. polar：扇形、圓弧、環形扇形。
+格式：theta_min, theta_max, r_inner, r_outer。符號 alpha 預設弧度；度數請寫成如 -30*pi/180。
+半徑 r0、總角度 alpha 的扇形使用 theta_min="-alpha/2", theta_max="alpha/2", r_inner="0", r_outer="r0"。
+
+D. unsupported：照片不完整、三維質量慣性矩、扭轉常數或無法精確表示。
+
+每個題目分開列出。若同圖寫 10-10 求 Ix、10-11 求 Iy，建立兩筆 problem，geometry 可相同。
+必須涵蓋：
+- y²=1−x 曲線陰影，分別求 x/y 軸。
+- y²=(b²/a)x 曲線陰影。
+- 半徑 r0、夾角 alpha 的扇形。
+- 三角形或梯形＋矩形＋圓孔。
+- T 型梁、U 型梁、多矩形梁，求形心 x' 軸與 y 軸。
+- 原始軸、形心軸、Ixy、J、kx、ky。
+
+輸出：
 {
-  "recognized_text": "照片中的題目文字",
-  "problem_summary": "題目要求與已知條件摘要",
-  "unit": "mm",
-  "requested_quantities": ["centroid", "Ix", "Iy"],
-  "target_axes": "整體形心 x、y 軸",
-  "origin_definition": "x=0 位於...，y=0 位於...",
-  "decomposition_reason": "如何拆分截面及原因",
-  "can_auto_build": true,
-  "confidence": 0.95,
-  "components": [
+  "recognized_text":"所有可辨識文字",
+  "problems":[
     {
-      "name": "上翼板",
-      "shape": "矩形",
-      "sign": 1,
-      "x": 60.0,
-      "y": 130.0,
-      "angle": 0,
-      "params": {"b": 120.0, "h": 20.0},
-      "source": "由圖中的尺寸取得"
+      "problem_id":"10-10",
+      "title":"陰影面積對 x 軸的慣性矩",
+      "recognized_text":"該題文字",
+      "mode":"composite | cartesian | polar | unsupported",
+      "unit":"mm | m | cm | in | symbolic",
+      "requested":["centroid","Ix_origin","Iy_origin","Ix_centroid","Iy_centroid","Ixy","J","kx","ky"],
+      "target_axes_description":"題圖上的 x 軸、y 軸或形心 x' 軸",
+      "axis_x":"0",
+      "axis_y":"0",
+      "variables":{"a":null,"b":null,"r0":null,"alpha":null},
+      "angle_variables_degrees":[],
+      "can_solve":true,
+      "confidence":0.95,
+      "reasoning_summary":"如何辨識區域與選擇解法",
+      "warnings":[],
+      "components":[],
+      "orientation":"horizontal",
+      "lower_bound":"-1",
+      "upper_bound":"1",
+      "left_function":"0",
+      "right_function":"1-y^2",
+      "lower_function":null,
+      "upper_function":null,
+      "theta_min":null,
+      "theta_max":null,
+      "r_inner":null,
+      "r_outer":null
     }
-  ],
-  "assumptions": ["假設所有尺寸單位均為 mm"],
-  "warnings": []
+  ]
 }
-"""
+
+所有 problem 保留完整欄位，不適用可填 null 或空陣列。confidence 介於 0 到 1。不可輸出 AI 自己算的最終 Ix/Iy。
+'''
 
 
 def _extract_json(text: str) -> Dict[str, Any]:
-    cleaned = text.strip()
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-
-    try:
-        return json.loads(cleaned)
+    cleaned=text.strip(); cleaned=re.sub(r"^```(?:json)?\s*","",cleaned,flags=re.I); cleaned=re.sub(r"\s*```$","",cleaned)
+    try: return json.loads(cleaned)
     except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(cleaned[start:end + 1])
+        a,b=cleaned.find("{"),cleaned.rfind("}")
+        if a>=0 and b>a: return json.loads(cleaned[a:b+1])
         raise ValueError("AI 回傳內容不是合法 JSON。")
 
 
-def _normalize_result(data: Dict[str, Any]) -> Dict[str, Any]:
-    defaults = {
-        "recognized_text": "",
-        "problem_summary": "",
-        "unit": "mm",
-        "requested_quantities": [],
-        "target_axes": "整體形心 x、y 軸",
-        "origin_definition": "",
-        "decomposition_reason": "",
-        "can_auto_build": False,
-        "confidence": 0.0,
-        "components": [],
-        "assumptions": [],
-        "warnings": [],
-    }
-    result = {**defaults, **(data or {})}
-    for key in ("components", "assumptions", "warnings", "requested_quantities"):
-        result[key] = result.get(key) or []
-
-    try:
-        result["confidence"] = max(0.0, min(1.0, float(result.get("confidence", 0))))
-    except (TypeError, ValueError):
-        result["confidence"] = 0.0
-
-    if not isinstance(result.get("can_auto_build"), bool):
-        result["can_auto_build"] = str(result.get("can_auto_build")).lower() == "true"
-
+def _normalize(data: Dict[str, Any]) -> Dict[str, Any]:
+    result={"recognized_text":str((data or {}).get("recognized_text") or ""),"problems":[]}
+    for i,raw in enumerate((data or {}).get("problems") or [],1):
+        p={
+            "problem_id":str(raw.get("problem_id") or f"題目 {i}"),"title":str(raw.get("title") or ""),"recognized_text":str(raw.get("recognized_text") or ""),
+            "mode":str(raw.get("mode") or "unsupported").lower(),"unit":str(raw.get("unit") or "symbolic"),"requested":raw.get("requested") or [],
+            "target_axes_description":str(raw.get("target_axes_description") or ""),"axis_x":"0" if raw.get("axis_x") is None else str(raw.get("axis_x")),"axis_y":"0" if raw.get("axis_y") is None else str(raw.get("axis_y")),
+            "variables":raw.get("variables") or {},"angle_variables_degrees":raw.get("angle_variables_degrees") or [],"can_solve":bool(raw.get("can_solve",False)),
+            "confidence":0.0,"reasoning_summary":str(raw.get("reasoning_summary") or ""),"warnings":raw.get("warnings") or [],"components":raw.get("components") or [],
+            "orientation":raw.get("orientation"),"lower_bound":raw.get("lower_bound"),"upper_bound":raw.get("upper_bound"),"left_function":raw.get("left_function"),"right_function":raw.get("right_function"),
+            "lower_function":raw.get("lower_function"),"upper_function":raw.get("upper_function"),"theta_min":raw.get("theta_min"),"theta_max":raw.get("theta_max"),"r_inner":raw.get("r_inner"),"r_outer":raw.get("r_outer")}
+        try: p["confidence"]=max(0.0,min(1.0,float(raw.get("confidence",0))))
+        except Exception: p["confidence"]=0.0
+        result["problems"].append(p)
     return result
 
 
-def analyze_with_gemini(
-    image_bytes: bytes,
-    mime_type: str,
-    api_key: str,
-    model: str = "gemini-3.5-flash",
-) -> Dict[str, Any]:
+def analyze_images(images: Sequence[Tuple[bytes,str]], api_key: str, model: str="gemini-3.5-flash") -> Dict[str, Any]:
+    if not api_key.strip(): raise ValueError("沒有可用的 Gemini API Key。")
+    if not images: raise ValueError("請至少上傳一張圖片。")
     try:
         from google import genai
         from google.genai import types
-    except ImportError as exc:
-        raise RuntimeError("伺服器尚未安裝 google-genai。") from exc
-
-    client = genai.Client(api_key=api_key)
-    image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
-    config = types.GenerateContentConfig(
-        temperature=0.1,
-        response_mime_type="application/json",
-    )
-    response = client.models.generate_content(
-        model=model,
-        contents=[image_part, ANALYSIS_PROMPT],
-        config=config,
-    )
-    text = getattr(response, "text", "")
-    if not text:
-        raise RuntimeError("Gemini 沒有回傳可讀取的結果。")
-    return _normalize_result(_extract_json(text))
-
-
-def analyze_with_openai(
-    image_bytes: bytes,
-    mime_type: str,
-    api_key: str,
-    model: str = "gpt-5.5",
-) -> Dict[str, Any]:
+    except ImportError as exc: raise RuntimeError("伺服器尚未安裝 google-genai。") from exc
+    client=genai.Client(api_key=api_key.strip())
+    contents=[types.Part.from_bytes(data=b,mime_type=m) for b,m in images]+[PROMPT]
+    config=types.GenerateContentConfig(temperature=0.05,response_mime_type="application/json")
     try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("伺服器尚未安裝 openai。") from exc
-
-    encoded = base64.b64encode(image_bytes).decode("utf-8")
-    data_url = f"data:{mime_type};base64,{encoded}"
-    client = OpenAI(api_key=api_key)
-
-    response = client.responses.create(
-        model=model,
-        input=[{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": ANALYSIS_PROMPT},
-                {"type": "input_image", "image_url": data_url, "detail": "high"},
-            ],
-        }],
-    )
-    text = getattr(response, "output_text", "")
-    if not text:
-        raise RuntimeError("OpenAI 沒有回傳可讀取的結果。")
-    return _normalize_result(_extract_json(text))
-
-
-def analyze_image(
-    image_bytes: bytes,
-    mime_type: str,
-    provider: str,
-    api_key: str,
-    model: str,
-) -> Dict[str, Any]:
-    if not api_key.strip():
-        raise ValueError("沒有可用的 API Key。")
-
-    provider_lower = provider.strip().lower()
-    if provider_lower.startswith("gemini") or provider_lower.startswith("google"):
-        return analyze_with_gemini(
-            image_bytes, mime_type, api_key.strip(),
-            model.strip() or "gemini-3.5-flash",
-        )
-    if provider_lower.startswith("openai") or provider_lower.startswith("gpt"):
-        return analyze_with_openai(
-            image_bytes, mime_type, api_key.strip(),
-            model.strip() or "gpt-5.5",
-        )
-    raise ValueError(f"未知 AI 服務：{provider}")
+        response=client.models.generate_content(model=model.strip() or "gemini-3.5-flash",contents=contents,config=config)
+    except Exception as exc:
+        msg=str(exc)
+        if "403" in msg or "PERMISSION_DENIED" in msg:
+            raise RuntimeError("Gemini 專案或 API Key 被拒絕存取（403）。請換成可正常使用、未外洩的個人 Google AI Studio API Key。") from exc
+        raise
+    text=getattr(response,"text","")
+    if not text: raise RuntimeError("Gemini 沒有回傳結果。")
+    return _normalize(_extract_json(text))

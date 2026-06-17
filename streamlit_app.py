@@ -4,668 +4,226 @@ from __future__ import annotations
 import io
 import json
 import math
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Tuple
 
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle, Polygon
+from matplotlib.patches import Circle, Ellipse, Polygon, Wedge
 import pandas as pd
 from PIL import Image, ImageEnhance, ImageOps
 import streamlit as st
 
-from ai_service import analyze_image
-from section_engine import (
-    SHAPE_PARAMS,
-    InertiaCalculator,
-    SectionComponent,
-    build_teaching_text,
-    format_number,
-)
+from ai_service import analyze_images
+from geometry_engine import solve_composite
+from symbolic_engine import solve_symbolic
+
+st.set_page_config(page_title="AI 截面慣性矩全題型教學系統",page_icon="📐",layout="wide",initial_sidebar_state="expanded")
 
 
-st.set_page_config(
-    page_title="AI 截面慣性矩教學系統",
-    page_icon="📐",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+def init_state():
+    defaults={"analysis":None,"selected_problem":0,"solution":None,"analysis_count":0,"rotation":{},"enhance":True,"edited_problem_json":""}
+    for k,v in defaults.items():
+        if k not in st.session_state: st.session_state[k]=v
 
 
-COLUMN_ORDER = [
-    "編號", "名稱", "形狀", "性質", "x", "y", "θ",
-    "b", "h", "B", "H", "tw", "tf", "d", "D",
-]
-
-DEFAULT_ROWS = [
-    {
-        "編號": 1, "名稱": "矩形 1", "形狀": "矩形", "性質": "實體",
-        "x": 50.0, "y": 25.0, "θ": 0.0,
-        "b": 100.0, "h": 50.0,
-        "B": None, "H": None, "tw": None, "tf": None, "d": None, "D": None,
-    }
-]
+def secret(name,default=None):
+    try: return st.secrets.get(name,default)
+    except Exception: return default
 
 
-def init_state() -> None:
-    defaults = {
-        "ai_result": None,
-        "component_df": pd.DataFrame(DEFAULT_ROWS, columns=COLUMN_ORDER),
-        "calculation": None,
-        "analysis_count": 0,
-        "processed_image": None,
-        "processed_mime": "image/jpeg",
-        "image_rotation": 0,
-        "enhance_image": False,
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+def fmt(v):
+    if v is None: return "—"
+    try: n=float(v)
+    except Exception: return str(v)
+    if n==0: return "0"
+    if abs(n)>=1e6 or abs(n)<1e-3: return f"{n:.6e}"
+    return f"{n:.6f}".rstrip("0").rstrip(".")
 
 
-def read_secret(name: str, default: Any = None) -> Any:
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return default
+def prepare_image(uploaded,rotation,enhance)->Tuple[bytes,str,Image.Image]:
+    image=ImageOps.exif_transpose(Image.open(uploaded)).convert("RGB")
+    if rotation: image=image.rotate(rotation,expand=True)
+    if enhance:
+        image=ImageOps.autocontrast(image); image=ImageEnhance.Contrast(image).enhance(1.15); image=ImageEnhance.Sharpness(image).enhance(1.25)
+    if max(image.size)>2400: image.thumbnail((2400,2400),Image.Resampling.LANCZOS)
+    buf=io.BytesIO(); image.save(buf,format="JPEG",quality=93,optimize=True)
+    return buf.getvalue(),"image/jpeg",image
 
 
-def require_password() -> None:
-    password = str(read_secret("APP_PASSWORD", "") or "")
-    if not password:
-        return
-
-    if st.session_state.get("authenticated"):
-        return
-
-    st.title("🔒 AI 截面慣性矩教學系統")
-    entered = st.text_input("請輸入使用密碼", type="password")
-    if st.button("進入系統", type="primary", use_container_width=True):
-        if entered == password:
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("密碼錯誤。")
-    st.stop()
-
-
-def prepare_image(uploaded_file) -> Tuple[bytes, str, Image.Image]:
-    image = Image.open(uploaded_file)
-    image = ImageOps.exif_transpose(image).convert("RGB")
-
-    rotation = int(st.session_state.image_rotation) % 360
-    if rotation:
-        image = image.rotate(rotation, expand=True)
-
-    if st.session_state.enhance_image:
-        image = ImageOps.autocontrast(image)
-        image = ImageEnhance.Contrast(image).enhance(1.2)
-        image = ImageEnhance.Sharpness(image).enhance(1.35)
-
-    max_side = 2200
-    if max(image.size) > max_side:
-        image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-
-    output = io.BytesIO()
-    image.save(output, format="JPEG", quality=92, optimize=True)
-    return output.getvalue(), "image/jpeg", image
-
-
-def ai_components_to_dataframe(result: Dict[str, Any]) -> pd.DataFrame:
-    rows = []
-    for index, item in enumerate(result.get("components") or [], start=1):
-        params = item.get("params") or {}
-        sign = item.get("sign", 1)
-        try:
-            is_hole = float(sign) < 0
-        except (TypeError, ValueError):
-            is_hole = str(sign).lower() in {"孔洞", "hole", "-"}
-
-        row = {
-            "編號": index,
-            "名稱": item.get("name") or f"子截面 {index}",
-            "形狀": SectionComponent.normalize_shape(item.get("shape", "")),
-            "性質": "孔洞" if is_hole else "實體",
-            "x": item.get("x", 0),
-            "y": item.get("y", 0),
-            "θ": item.get("angle", 0),
-            "b": params.get("b"),
-            "h": params.get("h"),
-            "B": params.get("B"),
-            "H": params.get("H"),
-            "tw": params.get("tw"),
-            "tf": params.get("tf"),
-            "d": params.get("d"),
-            "D": params.get("D"),
-        }
-        rows.append(row)
-
-    return pd.DataFrame(rows, columns=COLUMN_ORDER)
-
-
-def dataframe_to_components(df: pd.DataFrame) -> List[SectionComponent]:
-    components = []
-    errors = []
-
-    for position, (_, row) in enumerate(df.iterrows(), start=1):
-        shape = SectionComponent.normalize_shape(row.get("形狀", ""))
-        if shape not in SHAPE_PARAMS:
-            errors.append(f"第 {position} 列：不支援的形狀「{shape}」。")
-            continue
-
-        params = {}
-        for key in SHAPE_PARAMS[shape]:
-            value = row.get(key)
-            if pd.isna(value) or str(value).strip() == "":
-                errors.append(f"第 {position} 列「{row.get('名稱', '')}」缺少尺寸 {key}。")
-                continue
-            try:
-                params[key] = float(value)
-            except (TypeError, ValueError):
-                errors.append(f"第 {position} 列的尺寸 {key} 不是數值。")
-
-        try:
-            component = SectionComponent(
-                cid=position,
-                name=str(row.get("名稱") or f"子截面 {position}"),
-                shape=shape,
-                sign=-1 if str(row.get("性質", "實體")) == "孔洞" else 1,
-                x=float(row.get("x", 0)),
-                y=float(row.get("y", 0)),
-                angle=float(row.get("θ", 0) or 0),
-                params=params,
-            )
-            component.validate()
-            components.append(component)
-        except Exception as exc:
-            errors.append(f"第 {position} 列：{exc}")
-
-    if errors:
-        raise ValueError("\n".join(errors))
-    return components
-
-
-def component_local_polygons(component: SectionComponent):
-    p = component.params
-
-    if component.shape == "矩形":
-        b, h = p["b"], p["h"]
-        return [([(-b/2, -h/2), (b/2, -h/2), (b/2, h/2), (-b/2, h/2)], False)]
-
-    if component.shape == "I 型鋼":
-        B, H, tw, tf = p["B"], p["H"], p["tw"], p["tf"]
-        points = [
-            (-B/2, H/2), (B/2, H/2), (B/2, H/2-tf),
-            (tw/2, H/2-tf), (tw/2, -H/2+tf),
-            (B/2, -H/2+tf), (B/2, -H/2),
-            (-B/2, -H/2), (-B/2, -H/2+tf),
-            (-tw/2, -H/2+tf), (-tw/2, H/2-tf),
-            (-B/2, H/2-tf),
-        ]
-        return [(points, False)]
-
-    if component.shape == "T 型截面":
-        B, H, tw, tf = p["B"], p["H"], p["tw"], p["tf"]
-        hw = H - tf
-        af, aw = B * tf, tw * hw
-        y_centroid = (af * (H - tf/2) + aw * (hw/2)) / (af + aw)
-        points_from_bottom = [
-            (-tw/2, 0), (tw/2, 0), (tw/2, H-tf),
-            (B/2, H-tf), (B/2, H),
-            (-B/2, H), (-B/2, H-tf), (-tw/2, H-tf),
-        ]
-        return [([(x, y-y_centroid) for x, y in points_from_bottom], False)]
-
-    if component.shape == "中空矩形":
-        B, H, b, h = p["B"], p["H"], p["b"], p["h"]
-        outer = [(-B/2, -H/2), (B/2, -H/2), (B/2, H/2), (-B/2, H/2)]
-        inner = [(-b/2, -h/2), (b/2, -h/2), (b/2, h/2), (-b/2, h/2)]
-        return [(outer, False), (inner, True)]
-
-    return []
-
-
-def rotate_points(points, degrees: float):
-    angle = math.radians(degrees)
-    cos_value = math.cos(angle)
-    sin_value = math.sin(angle)
-    return [
-        (x*cos_value - y*sin_value, x*sin_value + y*cos_value)
-        for x, y in points
-    ]
-
-
-def draw_section(components: List[SectionComponent], result: Dict[str, Any] | None):
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.set_aspect("equal", adjustable="box")
-    palette = ["#d9eaf7", "#e4f3df", "#fff0cf", "#eadff4", "#dff3f1", "#f6dfdf"]
-
-    for index, component in enumerate(components):
-        facecolor = palette[index % len(palette)] if component.sign == 1 else "white"
-        edgecolor = "#315f7d" if component.sign == 1 else "#b23b3b"
-        linestyle = "-" if component.sign == 1 else "--"
-
-        if component.shape in ("圓形", "中空圓管"):
-            diameter = component.params["d"] if component.shape == "圓形" else component.params["D"]
-            ax.add_patch(Circle(
-                (component.x, component.y),
-                diameter / 2,
-                facecolor=facecolor,
-                edgecolor=edgecolor,
-                linewidth=2,
-                linestyle=linestyle,
-            ))
-            if component.shape == "中空圓管":
-                ax.add_patch(Circle(
-                    (component.x, component.y),
-                    component.params["d"] / 2,
-                    facecolor="white",
-                    edgecolor=edgecolor,
-                    linewidth=2,
-                ))
-        else:
-            for points, is_inner in component_local_polygons(component):
-                points = rotate_points(points, component.angle)
-                points = [(x + component.x, y + component.y) for x, y in points]
-                ax.add_patch(Polygon(
-                    points,
-                    closed=True,
-                    facecolor="white" if is_inner else facecolor,
-                    edgecolor=edgecolor,
-                    linewidth=2,
-                    linestyle=linestyle if not is_inner else "-",
-                ))
-
-        ax.plot(component.x, component.y, marker="+", markersize=9, color="#222222")
-        ax.annotate(str(component.cid), (component.x, component.y), xytext=(5, 5), textcoords="offset points")
-
-    if result:
-        ax.axhline(result["ybar"], color="#d1495b", linewidth=1.8, linestyle="--", label="整體形心 x 軸")
-        ax.axvline(result["xbar"], color="#00798c", linewidth=1.8, linestyle="--", label="整體形心 y 軸")
-        ax.plot(result["xbar"], result["ybar"], "ko", markersize=5)
-        ax.annotate(
-            f"G ({format_number(result['xbar'])}, {format_number(result['ybar'])})",
-            (result["xbar"], result["ybar"]),
-            xytext=(8, 8),
-            textcoords="offset points",
-        )
-        ax.legend(loc="best")
-
-    ax.autoscale_view()
-    ax.margins(0.15)
-    ax.grid(True, alpha=0.18)
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_title("截面配置與整體形心軸")
-    fig.tight_layout()
-    return fig
-
-
-def result_to_csv(result: Dict[str, Any]) -> bytes:
-    frame = pd.DataFrame(result["rows"])
-    output = io.StringIO()
-    frame.to_csv(output, index=False)
-    summary = pd.DataFrame([{
-        "總面積 A": result["A_total"],
-        "xbar": result["xbar"],
-        "ybar": result["ybar"],
-        "Ix": result["Ix_total"],
-        "Iy": result["Iy_total"],
-        "kx": result["kx"],
-        "ky": result["ky"],
-    }])
-    output.write("\n")
-    summary.to_csv(output, index=False)
-    return output.getvalue().encode("utf-8-sig")
-
-
-def show_ai_summary(result: Dict[str, Any]) -> None:
-    confidence = float(result.get("confidence", 0))
-    status = "可自動建立" if result.get("can_auto_build") else "需人工確認"
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("AI 信心度", f"{confidence:.0%}")
-    c2.metric("辨識狀態", status)
-    c3.metric("長度單位", result.get("unit", "mm"))
-
-    st.subheader("題目辨識")
-    st.write(result.get("recognized_text") or "未辨識到題目文字。")
-
-    st.subheader("題意與拆分方式")
-    st.write(result.get("problem_summary") or "無")
-    st.info(result.get("decomposition_reason") or "無拆分說明。")
-
-    warnings = result.get("warnings") or []
-    assumptions = result.get("assumptions") or []
-    if warnings:
-        st.warning("\n".join(f"• {item}" for item in warnings))
-    if assumptions:
-        with st.expander("AI 採用的假設"):
-            for item in assumptions:
-                st.write(f"• {item}")
-
-
-def sidebar_settings() -> Tuple[str, str, str]:
+def sidebar():
     st.sidebar.header("AI 與網站設定")
-
-    gemini_secret = str(read_secret("GEMINI_API_KEY", "") or "")
-    openai_secret = str(read_secret("OPENAI_API_KEY", "") or "")
-    available = []
-    if gemini_secret:
-        available.append("Gemini")
-    if openai_secret:
-        available.append("OpenAI / GPT")
-    if not available:
-        available = ["Gemini", "OpenAI / GPT"]
-
-    provider = st.sidebar.selectbox("AI 服務", available)
-    default_model = "gemini-3.5-flash" if provider == "Gemini" else "gpt-5.5"
-    model = st.sidebar.text_input("模型名稱", value=default_model)
-
-    server_key = gemini_secret if provider == "Gemini" else openai_secret
-    allow_user_key = bool(read_secret("ALLOW_USER_API_KEY", True))
-
-    if server_key:
-        st.sidebar.success("網站已設定伺服器端 API Key，使用者不會看到金鑰。")
-        api_key = server_key
-    elif allow_user_key:
-        st.sidebar.warning("網站尚未設定內建金鑰。")
-        api_key = st.sidebar.text_input("請輸入自己的 API Key", type="password")
-    else:
-        st.sidebar.error("網站管理員尚未設定 API Key。")
-        api_key = ""
-
-    max_uses = int(read_secret("MAX_ANALYSES_PER_SESSION", 5) or 5)
-    st.sidebar.caption(
-        f"本次瀏覽器工作階段已解析 {st.session_state.analysis_count}/{max_uses} 次。"
-    )
+    key=str(secret("GEMINI_API_KEY","") or "")
+    model=st.sidebar.text_input("Gemini 模型",value=str(secret("GEMINI_MODEL","gemini-3.5-flash")))
+    if key: st.sidebar.success("已使用伺服器端 API Key，使用者看不到金鑰。")
+    elif bool(secret("ALLOW_USER_API_KEY",True)): key=st.sidebar.text_input("Gemini API Key",type="password")
+    else: st.sidebar.error("管理員尚未設定 Gemini API Key。")
+    max_count=int(secret("MAX_ANALYSES_PER_SESSION",5) or 5)
+    st.sidebar.caption(f"本次工作階段已解析 {st.session_state.analysis_count}/{max_count} 次。")
     st.sidebar.divider()
-    st.sidebar.caption(
-        "AI 負責讀圖與拆解；數值答案由本地公式引擎重新計算。"
-    )
-    return provider, model, api_key
+    st.sidebar.markdown("**本地引擎支援**\n- 組合截面、孔洞、多邊形\n- T/U/工字型梁\n- 曲線陰影直角座標積分\n- 極座標扇形積分\n- 原始軸、形心軸、指定軸\n- Ix、Iy、Ixy、J、kx、ky")
+    return key,model
 
 
-def render_upload_tab(provider: str, model: str, api_key: str) -> None:
+def render_upload(api_key,model):
     st.header("① 上傳題目照片")
-    st.write("手機或電腦都能使用。照片請包含完整圖形、尺寸線與題目文字。")
-
-    uploaded = st.file_uploader(
-        "選擇或拍攝題目圖片",
-        type=["jpg", "jpeg", "png", "webp", "bmp"],
-        accept_multiple_files=False,
-    )
-
-    if uploaded is None:
-        st.info("上傳照片後，系統會使用 AI 辨識題目並建立可編輯的截面資料。")
+    st.write("可一次上傳多張，例如題目文字與共用圖形分開拍。系統會辨識多個題號。")
+    files=st.file_uploader("拍攝或選擇題目圖片",type=["jpg","jpeg","png","webp","bmp"],accept_multiple_files=True)
+    if not files:
+        st.info("支援組合截面、曲線積分、圓形扇形、T/U 型梁及圓孔題目。")
         return
-
-    controls = st.columns([1, 1, 1, 4])
-    if controls[0].button("↶ 左轉 90°", use_container_width=True):
-        st.session_state.image_rotation = (st.session_state.image_rotation + 90) % 360
-    if controls[1].button("↷ 右轉 90°", use_container_width=True):
-        st.session_state.image_rotation = (st.session_state.image_rotation - 90) % 360
-    st.session_state.enhance_image = controls[2].toggle(
-        "自動增強",
-        value=st.session_state.enhance_image,
-    )
-
-    try:
-        image_bytes, mime_type, image = prepare_image(uploaded)
-        st.session_state.processed_image = image_bytes
-        st.session_state.processed_mime = mime_type
-        st.image(image, caption="目前送交 AI 分析的圖片", use_container_width=True)
-    except Exception as exc:
-        st.error(f"圖片處理失敗：{exc}")
-        return
-
-    max_uses = int(read_secret("MAX_ANALYSES_PER_SESSION", 5) or 5)
-    disabled = not api_key or st.session_state.analysis_count >= max_uses
-
-    if st.button(
-        "🔍 開始 AI 解析題目",
-        type="primary",
-        use_container_width=True,
-        disabled=disabled,
-    ):
-        if st.session_state.analysis_count >= max_uses:
-            st.error("本次工作階段已達解析次數上限。")
-            return
-
-        with st.spinner("AI 正在讀取題目文字、尺寸與截面配置……"):
+    prepared=[]; cols=st.columns(min(3,len(files)))
+    for i,f in enumerate(files):
+        k=f.name+str(f.size); rot=st.session_state.rotation.get(k,0)
+        with cols[i%len(cols)]:
+            st.caption(f.name); c1,c2=st.columns(2)
+            if c1.button("左轉",key=f"L{k}",use_container_width=True): st.session_state.rotation[k]=(rot+90)%360; st.rerun()
+            if c2.button("右轉",key=f"R{k}",use_container_width=True): st.session_state.rotation[k]=(rot-90)%360; st.rerun()
+            data,mime,img=prepare_image(f,rot,st.session_state.enhance); st.image(img,use_container_width=True); prepared.append((data,mime))
+    st.session_state.enhance=st.toggle("自動增強照片",value=st.session_state.enhance)
+    max_count=int(secret("MAX_ANALYSES_PER_SESSION",5) or 5)
+    if st.button("🔍 AI 辨識題目並建立解題模型",type="primary",use_container_width=True,disabled=(not api_key or st.session_state.analysis_count>=max_count)):
+        with st.spinner("正在辨識題號、尺寸、陰影範圍、曲線與指定軸……"):
             try:
-                result = analyze_image(
-                    image_bytes=image_bytes,
-                    mime_type=mime_type,
-                    provider=provider,
-                    api_key=api_key,
-                    model=model,
-                )
-                st.session_state.ai_result = result
-                st.session_state.analysis_count += 1
-                if result.get("components"):
-                    st.session_state.component_df = ai_components_to_dataframe(result)
-                st.session_state.calculation = None
-                st.success("解析完成。請到「確認截面與計算」頁籤核對資料。")
-            except Exception as exc:
-                st.error(f"AI 解析失敗：{exc}")
-
-    if not api_key:
-        st.warning("目前沒有可用的 API Key，管理員需在 Streamlit Secrets 設定金鑰。")
-
-    if st.session_state.ai_result:
-        st.divider()
-        show_ai_summary(st.session_state.ai_result)
+                a=analyze_images(prepared,api_key,model); st.session_state.analysis=a; st.session_state.selected_problem=0; st.session_state.solution=None; st.session_state.analysis_count+=1
+                ps=a.get("problems") or []
+                if ps: st.session_state.edited_problem_json=json.dumps(ps[0],ensure_ascii=False,indent=2)
+                st.success(f"辨識完成，共找到 {len(ps)} 個題目。")
+            except Exception as exc: st.error(f"AI 解析失敗：{exc}")
 
 
-def render_calculation_tab() -> None:
-    st.header("② 確認截面資料並計算")
-    st.warning("AI 可能讀錯模糊尺寸。計算前請對照原圖確認每列尺寸、x、y 與孔洞正負號。")
-
-    result = st.session_state.ai_result
-    if result:
-        with st.expander("查看 AI 題意摘要", expanded=False):
-            show_ai_summary(result)
-
-    unit_default = result.get("unit", "mm") if result else "mm"
-    unit = st.selectbox("長度單位", ["mm", "cm", "m", "in"], index=["mm", "cm", "m", "in"].index(unit_default) if unit_default in ["mm", "cm", "m", "in"] else 0)
-
-    column_config = {
-        "編號": st.column_config.NumberColumn("編號", disabled=True, width="small"),
-        "名稱": st.column_config.TextColumn("名稱", required=True),
-        "形狀": st.column_config.SelectboxColumn(
-            "形狀",
-            options=list(SHAPE_PARAMS.keys()),
-            required=True,
-        ),
-        "性質": st.column_config.SelectboxColumn(
-            "性質",
-            options=["實體", "孔洞"],
-            required=True,
-        ),
-        "x": st.column_config.NumberColumn("形心 x", format="%.6f"),
-        "y": st.column_config.NumberColumn("形心 y", format="%.6f"),
-        "θ": st.column_config.NumberColumn("旋轉角 θ°", format="%.3f"),
-        "b": st.column_config.NumberColumn("b", format="%.6f"),
-        "h": st.column_config.NumberColumn("h", format="%.6f"),
-        "B": st.column_config.NumberColumn("B", format="%.6f"),
-        "H": st.column_config.NumberColumn("H", format="%.6f"),
-        "tw": st.column_config.NumberColumn("tw", format="%.6f"),
-        "tf": st.column_config.NumberColumn("tf", format="%.6f"),
-        "d": st.column_config.NumberColumn("d", format="%.6f"),
-        "D": st.column_config.NumberColumn("D", format="%.6f"),
-    }
-
-    edited = st.data_editor(
-        st.session_state.component_df,
-        column_config=column_config,
-        column_order=COLUMN_ORDER,
-        num_rows="dynamic",
-        hide_index=True,
-        use_container_width=True,
-        key="component_editor",
-    )
-    edited = edited.copy()
-    edited["編號"] = range(1, len(edited) + 1)
-    st.session_state.component_df = edited
-
-    st.caption(
-        "矩形用 b、h；圓形用 d；I 型鋼／T 型截面用 B、H、tw、tf；"
-        "中空矩形用 B、H、b、h；中空圓管用 D、d。"
-    )
-
-    left, right = st.columns([1, 1])
-    calculate_clicked = left.button(
-        "🧮 套用平行軸定理並計算",
-        type="primary",
-        use_container_width=True,
-    )
-    if right.button("載入單一矩形測試資料", use_container_width=True):
-        st.session_state.component_df = pd.DataFrame(DEFAULT_ROWS, columns=COLUMN_ORDER)
-        st.session_state.calculation = None
-        st.rerun()
-
-    if calculate_clicked:
-        try:
-            components = dataframe_to_components(edited)
-            result_calc = InertiaCalculator.calculate(components)
-            st.session_state.calculation = {
-                "result": result_calc,
-                "components": [component.to_dict() for component in components],
-                "unit": unit,
-            }
-            st.success("計算完成。")
-        except Exception as exc:
-            st.error(str(exc))
-
-    calculation = st.session_state.calculation
-    if not calculation:
-        return
-
-    result_calc = calculation["result"]
-    components = [
-        SectionComponent(**item)
-        for item in calculation["components"]
-    ]
-    unit = calculation["unit"]
-
-    st.divider()
-    st.subheader("計算結果")
-    metrics = st.columns(7)
-    metrics[0].metric("總面積 A", f"{format_number(result_calc['A_total'])} {unit}²")
-    metrics[1].metric("x̄", f"{format_number(result_calc['xbar'])} {unit}")
-    metrics[2].metric("ȳ", f"{format_number(result_calc['ybar'])} {unit}")
-    metrics[3].metric("Ix", f"{format_number(result_calc['Ix_total'])} {unit}⁴")
-    metrics[4].metric("Iy", f"{format_number(result_calc['Iy_total'])} {unit}⁴")
-    metrics[5].metric("kx", f"{format_number(result_calc['kx'])} {unit}")
-    metrics[6].metric("ky", f"{format_number(result_calc['ky'])} {unit}")
-
-    preview_col, summary_col = st.columns([1.2, 1])
-    with preview_col:
-        figure = draw_section(components, result_calc)
-        st.pyplot(figure, use_container_width=True)
-        plt.close(figure)
-    with summary_col:
-        st.markdown("### 最終答案")
-        st.latex(r"\bar{x}=\frac{\sum A_i x_i}{\sum A_i},\qquad \bar{y}=\frac{\sum A_i y_i}{\sum A_i}")
-        st.latex(r"I_x=\sum\left(I_{x,c}+A_i d_y^2\right),\qquad I_y=\sum\left(I_{y,c}+A_i d_x^2\right)")
-        st.write(f"- **A = {format_number(result_calc['A_total'])} {unit}²**")
-        st.write(f"- **x̄ = {format_number(result_calc['xbar'])} {unit}**")
-        st.write(f"- **ȳ = {format_number(result_calc['ybar'])} {unit}**")
-        st.write(f"- **Ix = {format_number(result_calc['Ix_total'])} {unit}⁴**")
-        st.write(f"- **Iy = {format_number(result_calc['Iy_total'])} {unit}⁴**")
-        st.write(f"- **kx = {format_number(result_calc['kx'])} {unit}**")
-        st.write(f"- **ky = {format_number(result_calc['ky'])} {unit}**")
-
-    project = {
-        "unit": unit,
-        "ai_result": st.session_state.ai_result,
-        "components": calculation["components"],
-        "result": result_calc,
-    }
-    download_col1, download_col2 = st.columns(2)
-    download_col1.download_button(
-        "下載完整專案 JSON",
-        data=json.dumps(project, ensure_ascii=False, indent=2),
-        file_name="截面慣性矩專案.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-    download_col2.download_button(
-        "下載逐步計算 CSV",
-        data=result_to_csv(result_calc),
-        file_name="截面慣性矩逐步計算.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
+def problem_editor():
+    a=st.session_state.analysis
+    if not a or not a.get("problems"): return None
+    ps=a["problems"]; labels=[f"{p.get('problem_id')}｜{p.get('title','')}" for p in ps]
+    idx=st.selectbox("選擇要解的題目",range(len(ps)),format_func=lambda i:labels[i],index=min(st.session_state.selected_problem,len(ps)-1))
+    if idx!=st.session_state.selected_problem:
+        st.session_state.selected_problem=idx; st.session_state.solution=None; st.session_state.edited_problem_json=json.dumps(ps[idx],ensure_ascii=False,indent=2); st.rerun()
+    p=ps[idx]; c1,c2,c3=st.columns(3); c1.metric("題型",p.get("mode","")); c2.metric("信心度",f"{float(p.get('confidence',0)):.0%}"); c3.metric("單位",p.get("unit","symbolic"))
+    st.write(p.get("recognized_text") or ""); st.info(p.get("reasoning_summary") or "無模型說明。")
+    if p.get("warnings"): st.warning("\n".join(f"• {x}" for x in p["warnings"]))
+    with st.expander("進階：檢查或修正 AI 建立的解題 JSON"):
+        edited=st.text_area("修改後按套用",value=st.session_state.edited_problem_json,height=520)
+        if st.button("套用 JSON 修改"):
+            try:
+                parsed=json.loads(edited); ps[idx]=parsed; st.session_state.edited_problem_json=json.dumps(parsed,ensure_ascii=False,indent=2); st.session_state.solution=None; st.rerun()
+            except Exception as exc: st.error(f"JSON 格式錯誤：{exc}")
+    return ps[idx]
 
 
-def render_steps_tab() -> None:
-    st.header("③ 完整解題過程與驗算表")
-    calculation = st.session_state.calculation
-    if not calculation:
-        st.info("請先到「確認截面與計算」完成計算。")
-        return
-
-    result = calculation["result"]
-    unit = calculation["unit"]
-    frame = pd.DataFrame(result["rows"])
-
-    numeric_columns = [
-        "A", "±A", "xi", "yi", "±Axi", "±Ayi",
-        "±Ix,c(θ)", "±Iy,c(θ)", "Δx", "Δy",
-        "±AΔy²", "±AΔx²", "Ix,i", "Iy,i",
-    ]
-    display_frame = frame.drop(columns=["公式"]).copy()
-    for column in numeric_columns:
-        display_frame[column] = display_frame[column].map(format_number)
-
-    st.dataframe(display_frame, use_container_width=True, hide_index=True)
-    st.markdown(build_teaching_text(result, unit))
+def solve_problem(p):
+    if not p.get("can_solve",False): raise ValueError("AI 判定照片資訊不足。請補拍完整尺寸、曲線邊界或指定軸。")
+    mode=str(p.get("mode") or "").lower()
+    if mode=="composite":
+        return solve_composite(p.get("components") or [],axis_x=float(p.get("axis_x") or 0),axis_y=float(p.get("axis_y") or 0),rotated_axis_angle_deg=float(p.get("rotated_axis_angle_deg") or 0))
+    if mode in {"cartesian","cartesian_vertical","cartesian_horizontal","polar","sector","polar_region"}: return solve_symbolic(p)
+    raise ValueError(f"尚不支援題型：{mode}")
 
 
-def render_about_tab() -> None:
-    st.header("使用說明")
-    st.markdown(
-        """
-### 操作流程
-
-1. 上傳或直接拍攝題目照片。
-2. AI 辨識題目文字、尺寸、座標與孔洞。
-3. 到「確認截面與計算」核對 AI 建立的資料。
-4. 按下計算，系統以本地公式引擎求出形心、Ix、Iy、kx、ky。
-5. 查看逐步驗算表，或下載 JSON、CSV。
-
-### 公開網站版本
-
-部署完成後，其他人只要開啟網址即可使用，不必安裝 Python。
-API Key 應放在 Streamlit Secrets，不可直接寫在程式碼或上傳到 GitHub。
-
-### 注意
-
-AI 對模糊尺寸、斜拍照片、重疊尺寸線及不規則曲線可能辨識錯誤。
-本地公式計算正確的前提，是截面尺寸與位置輸入正確。
-        """
-    )
+def draw_composite(solution):
+    fig,ax=plt.subplots(figsize=(8,5.5)); colors=["#cfe5f5","#dcefd5","#f9e8bd","#e8daf4","#d7efed"]
+    for i,c in enumerate(solution.get("components") or []):
+        kind=str(c.get("kind") or ""); sign=-1 if float(c.get("sign",1))<0 else 1; fc=colors[i%len(colors)] if sign==1 else "white"; ec="#245f76" if sign==1 else "#b23b3b"; ls="-" if sign==1 else "--"
+        if kind=="rectangle":
+            b,h=float(c["b"]),float(c["h"]); x,y=float(c.get("x",0)),float(c.get("y",0)); ang=float(c.get("angle",0)); pts=[(-b/2,-h/2),(b/2,-h/2),(b/2,h/2),(-b/2,h/2)]; t=math.radians(ang); pts=[(x+px*math.cos(t)-py*math.sin(t),y+px*math.sin(t)+py*math.cos(t)) for px,py in pts]; ax.add_patch(Polygon(pts,closed=True,facecolor=fc,edgecolor=ec,linewidth=2,linestyle=ls))
+        elif kind=="circle":
+            r=float(c.get("r",float(c.get("d"))/2)); ax.add_patch(Circle((float(c.get("x",0)),float(c.get("y",0))),r,facecolor=fc,edgecolor=ec,linewidth=2,linestyle=ls))
+        elif kind=="ellipse":
+            ax.add_patch(Ellipse((float(c.get("x",0)),float(c.get("y",0))),2*float(c["a"]),2*float(c["b"]),angle=float(c.get("angle",0)),facecolor=fc,edgecolor=ec,linewidth=2,linestyle=ls))
+        elif kind in {"polygon","triangle","trapezoid"}: ax.add_patch(Polygon(c.get("vertices") or [],closed=True,facecolor=fc,edgecolor=ec,linewidth=2,linestyle=ls))
+        elif kind in {"circular_sector","sector"}:
+            a1,a2=float(c["theta1"]),float(c["theta2"])
+            if not str(c.get("angle_unit","rad")).lower().startswith("deg"): a1,a2=math.degrees(a1),math.degrees(a2)
+            ax.add_patch(Wedge((float(c.get("center_x",0)),float(c.get("center_y",0))),float(c.get("r_outer",c.get("r"))),a1,a2,width=float(c.get("r_outer",c.get("r")))-float(c.get("r_inner",0)),facecolor=fc,edgecolor=ec,linewidth=2,linestyle=ls))
+    ax.axhline(solution["ybar"],color="#d1495b",linestyle="--",label="形心 x' 軸"); ax.axvline(solution["xbar"],color="#00798c",linestyle="--",label="形心 y' 軸"); ax.axhline(solution["axis_y"],color="#777",linestyle=":",label="指定 x 軸"); ax.axvline(solution["axis_x"],color="#444",linestyle=":",label="指定 y 軸"); ax.plot(solution["xbar"],solution["ybar"],"ko"); ax.autoscale_view(); ax.margins(.15); ax.set_aspect("equal",adjustable="datalim"); ax.grid(alpha=.2); ax.legend(); ax.set_xlabel("x"); ax.set_ylabel("y"); fig.tight_layout(); return fig
 
 
-init_state()
-require_password()
-provider, model, api_key = sidebar_settings()
+def render_composite(p,s):
+    u=p.get("unit",""); st.subheader("計算結果")
+    vals=[("A",s["A"],f"{u}²"),("x̄",s["xbar"],u),("ȳ",s["ybar"],u),("Ix 原始軸",s["Ix_origin"],f"{u}⁴"),("Iy 原始軸",s["Iy_origin"],f"{u}⁴"),("Jₒ",s["J_origin"],f"{u}⁴")]
+    cols=st.columns(6)
+    for col,(lab,v,suf) in zip(cols,vals): col.metric(lab,f"{fmt(v)} {suf}")
+    vals2=[("Ix′",s["Ix_centroid"],f"{u}⁴"),("Iy′",s["Iy_centroid"],f"{u}⁴"),("Ixy′",s["Ixy_centroid"],f"{u}⁴"),("kx",s["kx_centroid"],u),("ky",s["ky_centroid"],u),("Jc",s["J_centroid"],f"{u}⁴")]
+    cols=st.columns(6)
+    for col,(lab,v,suf) in zip(cols,vals2): col.metric(lab,f"{fmt(v)} {suf}")
+    st.markdown("### 題目指定軸"); st.write(f"- 水平軸 y={s['axis_y']}：**Ix={fmt(s['Ix_axis_y'])} {u}⁴**"); st.write(f"- 垂直軸 x={s['axis_x']}：**Iy={fmt(s['Iy_axis_x'])} {u}⁴**")
+    l,r=st.columns([1,1.5])
+    with l:
+        fig=draw_composite(s); st.pyplot(fig,use_container_width=True); plt.close(fig)
+    with r: st.dataframe(pd.DataFrame(s["rows"]),use_container_width=True,hide_index=True)
+    st.latex(r"\bar{x}=\frac{\sum A_ix_i}{\sum A_i},\quad \bar{y}=\frac{\sum A_iy_i}{\sum A_i}"); st.latex(r"I_{x'}=\sum(I_{x,c_i}+A_i(y_i-\bar y)^2)"); st.latex(r"I_{y'}=\sum(I_{y,c_i}+A_i(x_i-\bar x)^2)")
 
-st.title("📐 AI 拍照解析－截面慣性矩輔助教學系統")
-st.caption("上傳題目照片，AI 自動辨識與拆分截面，再由本地公式引擎完成精確驗算。")
 
-tab_upload, tab_calc, tab_steps, tab_about = st.tabs([
-    "① 拍照上傳與 AI 解析",
-    "② 確認截面與計算",
-    "③ 完整步驟",
-    "使用說明",
-])
+def render_symbolic(p,s):
+    st.subheader("積分模型"); st.json(s["setup"]); st.subheader("精確答案")
+    order=[("A","面積 A"),("xbar","形心 x̄"),("ybar","形心 ȳ"),("Ix_origin","Ix 原始 x 軸"),("Iy_origin","Iy 原始 y 軸"),("Ix_target","Ix 指定水平軸"),("Iy_target","Iy 指定垂直軸"),("Ix_centroid","Ix′ 形心軸"),("Iy_centroid","Iy′ 形心軸"),("Ixy_origin","Ixy"),("J_origin","J"),("kx_centroid","kx"),("ky_centroid","ky")]
+    for k,label in order:
+        if k in s["results"]:
+            item=s["results"][k]; st.markdown(f"**{label}**"); st.latex(item["latex"])
+            if item.get("numeric") is not None: st.caption(f"數值：{fmt(item['numeric'])}")
+    st.subheader("積分式")
+    for label,latex in s.get("integrals",{}).items(): st.markdown(f"**{label}**"); st.latex(latex)
+    st.info("符號角度（例如 α）以弧度處理；度數會轉成 π/180。")
 
-with tab_upload:
-    render_upload_tab(provider, model, api_key)
-with tab_calc:
-    render_calculation_tab()
-with tab_steps:
-    render_steps_tab()
-with tab_about:
-    render_about_tab()
+
+def render_solve():
+    st.header("② 選擇題目、確認模型並計算"); p=problem_editor()
+    if not p: st.info("請先完成 AI 辨識。"); return
+    if st.button("🧮 使用本地公式引擎精確計算",type="primary",use_container_width=True):
+        with st.spinner("正在建立積分式／套用平行軸定理……"):
+            try: st.session_state.solution={"problem":p,"result":solve_problem(p)}; st.success("計算完成。")
+            except Exception as exc: st.error(str(exc))
+    solved=st.session_state.solution
+    if not solved or solved["problem"].get("problem_id")!=p.get("problem_id"): return
+    if solved["result"].get("mode")=="composite": render_composite(p,solved["result"])
+    else: render_symbolic(p,solved["result"])
+
+
+def render_steps():
+    st.header("③ 完整解題步驟"); solved=st.session_state.solution
+    if not solved: st.info("請先完成計算。"); return
+    p,s=solved["problem"],solved["result"]; st.markdown(f"## {p.get('problem_id')} {p.get('title','')}"); st.write(p.get("reasoning_summary") or "")
+    if s.get("mode")=="composite":
+        st.markdown("1. 拆成不重疊基本面積，孔洞用負面積。\n2. 求各面積、形心、自身形心慣性矩。\n3. 求整體形心。\n4. 套用平行軸定理。\n5. 加總並求 J、kx、ky。")
+        st.dataframe(pd.DataFrame(s["rows"]),use_container_width=True,hide_index=True)
+        st.latex(r"A=\sum s_iA_i"); st.latex(r"I_x=\sum s_i(I_{x,c_i}+A_id_y^2)"); st.latex(r"I_y=\sum s_i(I_{y,c_i}+A_id_x^2)")
+    else:
+        if s["mode"]=="cartesian": st.markdown("垂直條帶：dA=[y上−y下]dx；水平條帶：dA=[x右−x左]dy。Ix=∫y²dA，Iy=∫x²dA。")
+        else: st.markdown("極座標：dA=r dr dθ，x=r cosθ，y=r sinθ。")
+        for label,latex in s.get("integrals",{}).items(): st.markdown(f"**{label}**"); st.latex(latex)
+        for k,item in s["results"].items(): st.write(f"**{k}**"); st.latex(item["latex"])
+
+
+def render_export():
+    st.header("匯出與更新")
+    if st.session_state.analysis: st.download_button("下載 AI 辨識 JSON",json.dumps(st.session_state.analysis,ensure_ascii=False,indent=2),"題目辨識模型.json","application/json",use_container_width=True)
+    if st.session_state.solution: st.download_button("下載完整解題 JSON",json.dumps(st.session_state.solution,ensure_ascii=False,indent=2,default=str),"截面慣性矩完整解答.json","application/json",use_container_width=True)
+    st.markdown("新版 ZIP 解壓後，覆蓋 GitHub Repository 的同名檔案並 Commit。Streamlit 會自動重部署，原分享網址不變。")
+
+
+def render_help():
+    st.header("支援題型與限制")
+    st.markdown("""
+### 已支援
+- 原始 x/y 軸與形心 x′/y′ 軸的 Ix、Iy
+- 平行軸定理、Ixy、J、kx、ky
+- 矩形、圓、橢圓、多邊形、三角形、梯形、扇形
+- 孔洞與組合面積
+- T 型、U 型、工字型、多矩形梁
+- 直角座標曲線陰影積分
+- 極座標扇形與環形扇形
+- 一張照片多題號選擇
+
+### 目前不支援
+- 三維剛體質量慣性矩
+- 扭轉常數與塑性截面模數
+- 缺少完整邊界、尺寸或指定軸的照片
+""")
+
+init_state(); api_key,model=sidebar()
+st.title("📐 AI 拍照解析－截面慣性矩全題型教學系統 v2")
+st.caption("組合截面、曲線陰影積分、圓形扇形、T/U 型梁、指定軸與形心軸。")
+t1,t2,t3,t4,t5=st.tabs(["① 拍照與 AI 辨識","② 確認模型與計算","③ 完整步驟","匯出","使用說明"])
+with t1: render_upload(api_key,model)
+with t2: render_solve()
+with t3: render_steps()
+with t4: render_export()
+with t5: render_help()
